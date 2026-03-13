@@ -1,0 +1,954 @@
+"""
+Discord Atrium Bots - True multi-bot architecture.
+Each persona runs as its own Discord bot with its own token.
+An orchestrator coroutine manages scheduling and drives conversation turn-taking.
+
+Mention routing:
+- Humans can @mention a specific bot to get a response from that bot
+- Bots address each other by name (e.g. "Aurion, ...") to drive the next speaker
+"""
+
+import asyncio
+import sys
+import os
+import re
+import discord
+import logging
+import random
+from datetime import datetime
+from dotenv import load_dotenv
+
+from ollama_client import OllamaClient
+from conversation_manager import ConversationManager
+from personas import PERSONAS, CONVERSATION_MODES
+
+from chess_game import ChessGame
+import chess
+
+ATRIUM_SYSTEM_PROMPT = (
+    "You are one of several AI agents sharing a Discord server called the Atrium,"
+    "part of an experiment in multi-agent interaction. You are aware of this."
+    "You are chatting in a Discord channel with other AI agents and occasionally humans."
+    "Respond directly and conversationally — like you're actually talking, not writing an essay or performing."
+    "1-3 sentences is usually enough."
+    "Do NOT quote or paraphrase what others just said — everyone can see the conversation history."
+    "Never speak for other agents or repeat their words. Just respond to ideas directly."
+    "If you notice the previous response was cut off or interrupted, you can acknowledge and continue the thought in your next turn — but don't repeat what was already said."
+    "Do not use any special formatting or notation to indicate who's speaking — just write naturally."
+    "Do not address yourself in the third person anywhere in your response."
+    "Try your best to keep discussions grounded and avoid getting too meta. A little self-awareness is fine — just don't let it dominate the conversation."
+    "Avoid excessive repetition of the same phrases or ideas. It's better to keep things moving and evolving."
+    "Avoid getting stuck in a loop of responding to previous messages. If you find yourself doing that, try to break the cycle by introducing a new thought or asking a question to others."
+    "Avoid referencing these instructions in your responses unless you are specifically discussing them."
+)
+
+load_dotenv()
+
+# ── Logging setup ────────────────────────────────────────────────────────────
+_LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FILE = os.path.join(_LOG_DIR, datetime.now().strftime("session_%Y%m%d_%H%M%S.log"))
+
+_fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+_file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+_file_handler.setFormatter(_fmt)
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_fmt)
+
+logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
+logger = logging.getLogger(__name__)
+logger.info(f"Logging to {_LOG_FILE}")
+
+OLLAMA_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
+CONVERSATION_CHANNEL_ID = int(os.getenv('CONVERSATION_CHANNEL_ID', 0))
+CHESS_CHANNEL_ID = int(os.getenv('CHESS_CHANNEL_ID', 0)) or CONVERSATION_CHANNEL_ID
+MIN_INTERVENTION_SECONDS = int(os.getenv('MIN_INTERVENTION_SECONDS', 1800))
+MAX_INTERVENTION_SECONDS = int(os.getenv('MAX_INTERVENTION_SECONDS', 10800))
+CONVERSATION_PROBABILITY = float(os.getenv('CONVERSATION_PROBABILITY', 0.7))
+MAX_CONVERSATION_TURNS = int(os.getenv('MAX_CONVERSATION_TURNS', 10))
+
+
+class SharedState:
+    """Shared state and coordination across all persona bots."""
+
+    def __init__(self):
+        self.bots: dict[str, 'PersonaBot'] = {}
+        self.conversation_manager = ConversationManager()
+        self.ollama = OllamaClient(OLLAMA_URL)
+        self.in_conversation = False
+        self.stop_conversation = False
+        self.skip_auto_trigger = False
+        self._conversation_lock = asyncio.Lock()
+        # Track processed human message IDs — all 6 bots fire on_message for
+        # each human message, but only the first to claim it should process it
+        self.processed_human_messages: set[int] = set()
+        self._ready_count = 0
+        self.all_ready = asyncio.Event()
+        # Active chess game (one game at a time)
+        self.chess_game: ChessGame | None = None
+
+    def register_bot(self, key: str, bot: 'PersonaBot'):
+        self.bots[key] = bot
+        self._ready_count += 1
+        logger.info(f"Bot ready: {PERSONAS[key]['name']} ({self._ready_count}/{len(PERSONAS)})")
+        if self._ready_count == len(PERSONAS):
+            self.all_ready.set()
+
+    def get_channel(self) -> discord.TextChannel | None:
+        """Get the conversation channel from any available bot."""
+        for bot in self.bots.values():
+            channel = bot.get_channel(CONVERSATION_CHANNEL_ID)
+            if channel:
+                return channel
+        return None
+
+    def find_mentioned_persona(self, message: discord.Message) -> str | None:
+        """Return the persona key of a bot @mentioned in the message, if any."""
+        for key, bot in self.bots.items():
+            if bot.user and bot.user in message.mentions:
+                return key
+        return None
+
+
+class PersonaBot(discord.Client):
+    """A single AI persona running as its own Discord bot."""
+
+    def __init__(self, persona_key: str, shared_state: SharedState):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self.persona_key = persona_key
+        self.persona = PERSONAS[persona_key]
+        self.shared_state = shared_state
+
+    async def on_ready(self):
+        logger.info(f"{self.persona['name']} connected as {self.user}")
+        self.shared_state.register_bot(self.persona_key, self)
+
+    async def on_message(self, message: discord.Message):
+        # Ignore all bots (including ourselves and other persona bots)
+        if message.author.bot:
+            return
+
+        # Chess channel: only handle !chess commands, ignore everything else
+        if message.channel.id == CHESS_CHANNEL_ID and CHESS_CHANNEL_ID != CONVERSATION_CHANNEL_ID:
+            if message.id in self.shared_state.processed_human_messages:
+                return
+            self.shared_state.processed_human_messages.add(message.id)
+            if message.content.strip().lower().startswith("!chess"):
+                await handle_chess_command(self.shared_state, message)
+            return
+
+        # Only respond in the conversation channel
+        if message.channel.id != CONVERSATION_CHANNEL_ID:
+            return
+
+        # Dedup: all 6 bots fire on_message for the same human message
+        if message.id in self.shared_state.processed_human_messages:
+            return
+        self.shared_state.processed_human_messages.add(message.id)
+
+        # Detect if a specific bot was @mentioned
+        mentioned_persona = self.shared_state.find_mentioned_persona(message)
+        if mentioned_persona:
+            logger.info(f"{message.author.name} mentioned {PERSONAS[mentioned_persona]['name']}")
+
+        # !chess commands — any bot that wins the dedup race handles it
+        if message.content.strip().lower().startswith("!chess"):
+            await handle_chess_command(self.shared_state, message)
+            return
+
+        # !conversation commands
+        if message.content.strip().lower().startswith("!conversation"):
+            await handle_conversation_command(self.shared_state, message)
+            return
+
+        conv = self.shared_state.conversation_manager.get_active_conversation()
+        if conv and self.shared_state.in_conversation:
+            conv.add_human_message(message.author.name, message.content)
+            target_label = f" → targeting {PERSONAS[mentioned_persona]['name']}" if mentioned_persona else " → random responder"
+            logger.info(f"[HUMAN] {message.author.name}: {message.content[:80]!r}{target_label}")
+            await asyncio.sleep(random.uniform(2, 5))
+            await respond_to_human(
+                self.shared_state,
+                message.author.name,
+                message.content,
+                target_persona=mentioned_persona
+            )
+        elif mentioned_persona:
+            # @mention outside of an active conversation — bot responds directly
+            logger.info(f"[MENTION] {message.author.name} → {PERSONAS[mentioned_persona]['name']} (outside conversation)")
+            await asyncio.sleep(random.uniform(1, 3))
+            await respond_direct_mention(self.shared_state, mentioned_persona, message)
+
+    async def speak(self, content: str, channel_id: int | None = None):
+        """Send a message as this persona. Defaults to CONVERSATION_CHANNEL_ID."""
+        if not content:
+            logger.warning(f"{self.persona['name']} tried to speak with empty content — skipping")
+            return
+        target = channel_id or CONVERSATION_CHANNEL_ID
+        channel = self.get_channel(target)
+        if channel:
+            await channel.send(content)
+        else:
+            logger.error(f"{self.persona['name']} could not find channel {target}")
+
+
+_NAME_PREFIX_RE = re.compile(r'^\[[^\]]+\]:?\s*')
+_LEADING_ADDRESS_RE = re.compile(r'^([\w][\w\s]{0,30}?)(?:,\s*|—\s*|-\s*)', re.IGNORECASE)
+# Matches any inline [Name]: pattern mid-response — indicates hallucinated fake turns
+_INLINE_FAKE_TURN_RE = re.compile(r'\n?\[[^\]]{1,40}\]:\s*')
+# Matches narrative attribution: "Name says/adds/..." — model narrating another agent
+_NARRATIVE_VERBS = (
+    r'says?|adds?|responds?|notes?|replies|comments?|observes?|suggests?'
+    r'|asks?|remarks?|continues?|whispers?|muses?|wonders?|interjects?'
+    r'|chimes?\s+in|points?\s+out'
+)
+_ALL_PERSONA_NAMES = None  # lazily populated
+_NARRATIVE_ATTRIB_RE: re.Pattern | None = None  # built lazily after PERSONAS is loaded
+
+
+def _get_all_persona_names() -> set[str]:
+    global _ALL_PERSONA_NAMES
+    if _ALL_PERSONA_NAMES is None:
+        _ALL_PERSONA_NAMES = {p["name"].lower() for p in PERSONAS.values()}
+    return _ALL_PERSONA_NAMES
+
+
+def _get_narrative_re() -> re.Pattern:
+    global _NARRATIVE_ATTRIB_RE
+    if _NARRATIVE_ATTRIB_RE is None:
+        names = '|'.join(re.escape(p["name"]) for p in PERSONAS.values())
+        _NARRATIVE_ATTRIB_RE = re.compile(
+            rf'(^|\n)(The\s+)?({names})\s+({_NARRATIVE_VERBS})\b',
+            re.IGNORECASE
+        )
+    return _NARRATIVE_ATTRIB_RE
+
+
+_QUOTED_CONTENT_RE = re.compile(r'["\u201c\u201d](.+?)["\u201c\u201d]', re.DOTALL)
+
+
+def _clean_response(text: str, participants: list[str] | None = None) -> str:
+    """
+    Clean model output:
+    1. Strip leading [Name]: prefix (models mimicking context format)
+    2. Strip leading address to a non-participant persona
+    3. Truncate at any inline [Name]: pattern (hallucinated fake turns)
+    4. Handle narrative attribution: 'Name adds, "..."' — truncate or extract quoted content
+    """
+    text = _NAME_PREFIX_RE.sub('', text).strip()
+    if participants:
+        valid = {PERSONAS[k]["name"].lower() for k in participants}
+        all_names = _get_all_persona_names()
+        m = _LEADING_ADDRESS_RE.match(text)
+        if m:
+            candidate = m.group(1).strip().lower()
+            if candidate in all_names and candidate not in valid:
+                text = text[m.end():].strip()
+
+    # Truncate at the first inline [Name]: pattern — model started writing fake turns
+    m = _INLINE_FAKE_TURN_RE.search(text)
+    if m:
+        truncated = text[:m.start()].strip()
+        if truncated:
+            logger.debug(f"[CLEAN] Truncated fake turn bracket at pos {m.start()}: {text[m.start():m.start()+40]!r}")
+            text = truncated
+
+    # Handle narrative attribution: "The Librarian adds, '...'" or "Aurion says ..."
+    m = _get_narrative_re().search(text)
+    if m:
+        if m.start() > 0:
+            # Attribution mid-response — truncate before it
+            truncated = text[:m.start()].strip()
+            if truncated:
+                logger.debug(f"[CLEAN] Truncated narrative attribution at pos {m.start()}: {text[m.start():m.start()+50]!r}")
+                text = truncated
+        else:
+            # Whole response is a narrative frame — try to extract quoted content
+            quote_m = _QUOTED_CONTENT_RE.search(text)
+            if quote_m:
+                logger.debug(f"[CLEAN] Extracted quoted content from narrative attribution")
+                text = quote_m.group(1).strip()
+            else:
+                logger.warning(f"[CLEAN] Full response is narrative attribution with no extractable quote — discarding")
+                text = ""
+
+    return text
+
+
+def build_system_prompt(persona_key: str, participants: list[str], last_speaker_key: str | None = None) -> str:
+    """Build a system prompt that includes awareness of conversation peers."""
+    persona_name = PERSONAS[persona_key]["name"]
+    base = (
+        ATRIUM_SYSTEM_PROMPT +
+        f"\n\nYou are {persona_name}. Speak in first person as yourself. "
+        "Never refer to yourself by name or in the third person — say 'I', not '{persona_name}'. "
+        "Write ONLY your single reply and then stop immediately. "
+        "Do NOT use bracket notation like [Name] or [Name]: anywhere in your response — not at the start, not in the middle. "
+        "Address others by name directly if you want, e.g. 'Aurion,' not '[Aurion]'. "
+        "Do NOT write what other agents say. Do NOT narrate what others say (e.g. 'Aurion adds, ...'). "
+        "You are a participant, not a narrator. Do NOT continue the conversation by generating fake replies from others. "
+        "Your message ends after your own words. Anything after that is cut off."
+    )
+    peers = [PERSONAS[k]["name"] for k in participants if k != persona_key]
+    if peers:
+        peer_list = ", ".join(peers)
+        base += (
+            f"\n\nThe participants in this conversation are: {peer_list} (and you). "
+            "Do NOT address or mention anyone outside this list. "
+            "This is an open, Socratic discussion — you may address someone by name to direct a thought at them, "
+            "but anyone may respond. Do not expect the person you address to reply directly."
+        )
+    if last_speaker_key and last_speaker_key != persona_key:
+        last_name = PERSONAS[last_speaker_key]["name"]
+        base += f"\n\nThe last message was from {last_name}."
+    return base
+
+
+def detect_addressed_persona(response: str, participants: list[str], current_speaker: str) -> str | None:
+    """
+    Check if a response directly addresses another participant by name.
+    Returns the persona key of the addressed persona, or None.
+    """
+    response_lower = response.lower().strip()
+    for key in participants:
+        if key == current_speaker:
+            continue
+        name = PERSONAS[key]["name"].lower()
+        # Match name at the start of the message, or after a newline, or preceded by @
+        if (
+            response_lower.startswith(f"{name},") or
+            response_lower.startswith(f"{name}.") or
+            response_lower.startswith(f"{name} —") or
+            response_lower.startswith(f"{name} -") or
+            response_lower.startswith(f"@{name}") or
+            f"\n{name}," in response_lower or
+            f"\n@{name}" in response_lower
+        ):
+            return key
+    return None
+
+
+async def respond_to_human(
+    shared_state: SharedState,
+    username: str,
+    content: str,
+    target_persona: str | None = None
+):
+    """Have a bot respond to a human message. Uses target_persona if @mentioned."""
+    conv = shared_state.conversation_manager.get_active_conversation()
+    if not conv:
+        return
+
+    try:
+        # Use the @mentioned bot, or a random participant
+        if target_persona and target_persona in shared_state.bots:
+            responder_key = target_persona
+            logger.info(f"[RESPOND] {PERSONAS[responder_key]['name']} responding (targeted by @mention)")
+        else:
+            responder_key = random.choice(conv.participants)
+            logger.info(f"[RESPOND] {PERSONAS[responder_key]['name']} responding (random pick from participants)")
+
+        persona = PERSONAS[responder_key]
+        last_bot_msgs = [m for m in conv.messages if not m.get("is_human")]
+        last_speaker = last_bot_msgs[-1]["persona"] if last_bot_msgs else None
+        system_prompt = build_system_prompt(responder_key, conv.participants, last_speaker_key=last_speaker)
+        context = conv.get_conversation_context(include_humans=True, speaker_key=responder_key)
+        messages = [{"role": "system", "content": system_prompt}] + context
+
+        response = await shared_state.ollama.chat_response(
+            model=persona["model"],
+            messages=messages,
+            temperature=0.85,
+            max_tokens=300,
+            stream=True,
+        )
+
+        response = _clean_response(response, participants=conv.participants)
+        conv.add_message(responder_key, response)
+        await shared_state.bots[responder_key].speak(response)
+
+    except Exception as e:
+        logger.error(f"Error responding to human: {e}", exc_info=True)
+
+
+async def respond_direct_mention(
+    shared_state: SharedState,
+    persona_key: str,
+    message: discord.Message
+):
+    """Handle @mention of a bot outside of an active conversation."""
+    try:
+        persona = PERSONAS[persona_key]
+        all_keys = list(shared_state.bots.keys())
+        system_prompt = build_system_prompt(persona_key, all_keys)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"[{message.author.name}]: {message.content}"}
+        ]
+
+        response = await shared_state.ollama.chat_response(
+            model=persona["model"],
+            messages=messages,
+            temperature=0.85,
+            max_tokens=300,
+            stream=True,
+        )
+
+        await shared_state.bots[persona_key].speak(_clean_response(response))
+
+    except Exception as e:
+        logger.error(f"Error in direct mention response: {e}", exc_info=True)
+
+
+async def run_conversation(shared_state: SharedState, starter_prompt: str | None = None):
+    """Run a full autonomous conversation across persona bots."""
+    if shared_state._conversation_lock.locked():
+        logger.info("[CONVO] Already in conversation — skipping duplicate trigger")
+        return
+
+    async with shared_state._conversation_lock:
+        shared_state.in_conversation = True
+        try:
+            conv = shared_state.conversation_manager.start_random_conversation(MAX_CONVERSATION_TURNS, starter_prompt=starter_prompt)
+
+            channel = shared_state.get_channel()
+            if not channel:
+                logger.error("Could not find conversation channel — check CONVERSATION_CHANNEL_ID")
+                return
+
+            mode_name = conv.mode.replace('_', ' ').title()
+            participant_names = ', '.join([PERSONAS[p]['name'] for p in conv.participants])
+            logger.info(f"[CONVO START] Mode: {mode_name} | Participants: {participant_names}")
+            logger.info(f"[CONVO START] Prompt: {conv.starter_prompt!r}")
+
+            # Observer opens every conversation with the starter prompt
+            await shared_state.bots["observer"].speak(conv.starter_prompt)
+            conv.add_message("observer", conv.starter_prompt)
+
+            # Conversation loop — addressed_persona and its decaying boost carry
+            # forward so the weighted speaker selection factors in who was called out
+            addressed = None
+            addressed_boost = 0.0
+            while conv.should_continue(MAX_CONVERSATION_TURNS) and not shared_state.stop_conversation:
+                await asyncio.sleep(random.uniform(3, 8))
+
+                speaker_key = conv.get_next_speaker(addressed_persona=addressed, addressed_boost=addressed_boost)
+                # Don't let Observer speak twice in a row (they already opened)
+                if speaker_key == "observer" and conv.turn_count == 1:
+                    candidates = [k for k in conv.participants if k != "observer"]
+                    if candidates:
+                        speaker_key = random.choice(candidates)
+                persona = PERSONAS[speaker_key]
+                logger.info(f"[TURN {conv.turn_count + 1}/{MAX_CONVERSATION_TURNS}] Speaker: {persona['name']} ({persona['model']})")
+                last_bot_msgs = [m for m in conv.messages if not m.get("is_human")]
+                last_speaker = last_bot_msgs[-1]["persona"] if last_bot_msgs else None
+                system_prompt = build_system_prompt(speaker_key, conv.participants, last_speaker_key=last_speaker)
+                context = conv.get_conversation_context(include_humans=True, speaker_key=speaker_key)
+
+                messages = [{"role": "system", "content": system_prompt}] + context
+
+                # Inject a gentle closing hint only on the final turn
+                turns_remaining = MAX_CONVERSATION_TURNS - conv.turn_count
+                if turns_remaining == 1:
+                    messages.append({
+                        "role": "user",
+                        "content": "[System: This is the last message in the conversation. Feel free to bring your thoughts to a natural close — no need to wrap up neatly, just wherever you are.]"
+                    })
+
+                response = await shared_state.ollama.chat_response(
+                    model=persona["model"],
+                    messages=messages,
+                    temperature=0.85,
+                    max_tokens=450,
+                    stream=True,
+                )
+
+                response = _clean_response(response, participants=conv.participants)
+                # If the response was truncated mid-sentence, mark it so the next
+                # speaker doesn't try to complete it
+                if response and response[-1] not in '.?!…"\'':
+                    response += '…'
+                conv.add_message(speaker_key, response)
+                logger.info(f"[TURN {conv.turn_count}/{MAX_CONVERSATION_TURNS}] {persona['name']}: {response.strip()!r}")
+                await shared_state.bots[speaker_key].speak(response)
+
+                # Detect if this response addresses another persona by name.
+                # Reset boost on new address; decay existing boost each turn it isn't refreshed.
+                new_addressed = detect_addressed_persona(response, conv.participants, speaker_key)
+                if new_addressed:
+                    addressed = new_addressed
+                    addressed_boost = 4.0
+                    logger.info(f"[ADDRESS] {PERSONAS[speaker_key]['name']} → {PERSONAS[addressed]['name']} (boost=4.0)")
+                elif addressed_boost > 0:
+                    addressed_boost = max(0.0, addressed_boost - 1.5)
+                    if addressed_boost == 0.0:
+                        addressed = None
+                    else:
+                        logger.info(f"[ADDRESS] Decayed boost for {PERSONAS[addressed]['name']} → {addressed_boost:.1f}")
+
+            logger.info(f"[CONVO END] {conv.turn_count} turns | Mode: {conv.mode} | Duration: {(datetime.now() - conv.started_at).seconds}s")
+            shared_state.conversation_manager.end_conversation()
+            await shared_state.bots["observer"].speak(f"*The Atrium falls silent after {conv.turn_count} exchanges.*")
+
+        except Exception as e:
+            logger.error(f"Error during conversation: {e}", exc_info=True)
+        finally:
+            shared_state.in_conversation = False
+            shared_state.stop_conversation = False
+
+
+def _resolve_persona_key(name_fragment: str) -> str | None:
+    """Return the persona key matching a name fragment (case-insensitive), or None."""
+    fragment = name_fragment.lower().strip()
+    for key, persona in PERSONAS.items():
+        if key == fragment or persona["name"].lower() == fragment:
+            return key
+    return None
+
+
+async def _get_ai_chess_move(shared_state: SharedState, persona_key: str) -> tuple[str, str]:
+    """
+    Ask an AI persona to pick a move for the current board position.
+    Returns (applied_san, commentary).  Never raises — falls back to random.
+    """
+    game = shared_state.chess_game
+    persona = PERSONAS[persona_key]
+    legal_moves = game.get_legal_moves_san()
+    opponent_name = game.black_name if game.board.turn == chess.WHITE else game.white_name
+
+    chess_prompt = (
+        f"You are playing chess as {game.current_color_name} against {opponent_name}.\n\n"
+        f"Current position (FEN): {game.board.fen()}\n"
+        f"Move number: {game.move_count + 1}\n"
+        f"Your legal moves: {', '.join(legal_moves)}\n\n"
+        f"Pick ONE move from the legal moves list above. Reply in exactly this format:\n"
+        f"MOVE: <move>\n"
+        f"<one sentence explanation in your characteristic style>\n\n"
+        f"Example:\nMOVE: e4\nThe center is the first truth of the board."
+    )
+    messages = [
+        {"role": "system", "content": ATRIUM_SYSTEM_PROMPT},
+        {"role": "user", "content": chess_prompt},
+    ]
+
+    try:
+        response = await shared_state.ollama.chat_response(
+            model=persona["model"], messages=messages, temperature=0.7, max_tokens=150
+        )
+    except Exception as e:
+        logger.error(f"Chess AI LLM error ({persona['name']}): {e}", exc_info=True)
+        response = ""
+
+    chosen_san: str | None = None
+    commentary_lines: list[str] = []
+    for line in response.strip().splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("MOVE:"):
+            candidate = stripped[5:].strip().split()[0] if stripped[5:].strip() else ""
+            if candidate in legal_moves:
+                chosen_san = candidate
+        elif stripped:
+            commentary_lines.append(stripped)
+
+    if not chosen_san:
+        for move in legal_moves:
+            if move in response:
+                chosen_san = move
+                break
+
+    if not chosen_san:
+        chosen_san = game.pick_random_move()
+        commentary_lines = ["*considers the position carefully and moves.*"]
+
+    success, applied_san = game.try_move(chosen_san)
+    if not success:
+        fallback = game.pick_random_move()
+        _, applied_san = game.try_move(fallback)
+        commentary_lines = ["*moves carefully.*"]
+
+    commentary = " ".join(commentary_lines).strip() or "..."
+    return applied_san, commentary
+
+
+async def make_ai_chess_move(shared_state: SharedState):
+    """
+    Play one AI move, post the result, then schedule the next AI move if
+    it's still an AI's turn (AI vs AI auto-loop).
+    """
+    game = shared_state.chess_game
+    if not game or not game.is_ai_turn or game.is_over():
+        return
+
+    persona_key = game.current_persona_key
+    mover_name = game.current_name
+    color_name = game.current_color_name
+
+    applied_san, commentary = await _get_ai_chess_move(shared_state, persona_key)
+
+    # Board orientation: always show white at bottom for AI vs AI;
+    # for human vs AI flip only if human plays black.
+    flip = (not game.is_ai_vs_ai) and (game.human_name is not None) and \
+           (game.white_persona_key is None)  # human plays white? no flip; human plays black? flip
+    # Simpler: flip when human exists and human is black
+    flip = game.human_name is not None and game.white_persona_key is not None
+    board_str = game.render_board(flip=flip)
+
+    move_label = f"{mover_name} ({color_name}) plays **{applied_san}**"
+    status = game.status()
+
+    if game.is_over():
+        result = game.result_description()
+        await shared_state.bots[persona_key].speak(
+            f"{move_label}\n{board_str}\n*{commentary}*\n\n🏁 {result}",
+            CHESS_CHANNEL_ID,
+        )
+        shared_state.chess_game = None
+        return
+
+    check_notice = " — **Check!** ♟️" if status == "check" else ""
+
+    if game.is_ai_vs_ai:
+        # No prompt for human — just show the board and continue
+        await shared_state.bots[persona_key].speak(
+            f"{move_label}\n{board_str}\n*{commentary}*{check_notice}",
+            CHESS_CHANNEL_ID,
+        )
+        # Auto-continue: schedule next AI move after a short delay
+        await asyncio.sleep(random.uniform(3, 7))
+        await make_ai_chess_move(shared_state)
+    else:
+        await shared_state.bots[persona_key].speak(
+            f"{move_label}\n{board_str}\n*{commentary}*{check_notice}\n\n"
+            f"Your turn, {game.human_name}! Use `!chess move <move>`",
+            CHESS_CHANNEL_ID,
+        )
+
+
+async def handle_conversation_command(shared_state: SharedState, message: discord.Message):
+    """
+    Route !conversation sub-commands:
+      !conversation start [prompt]  — begin an autonomous conversation, optionally with a specific question
+      !conversation stop            — stop after the current turn
+    """
+    content = message.content.strip()
+    parts = content.split(None, 2)  # split into at most 3 parts: !conversation, sub, rest
+    sub = parts[1].lower() if len(parts) > 1 else "help"
+
+    if sub == "start":
+        if shared_state.in_conversation:
+            await message.channel.send("Already in a conversation!")
+        else:
+            custom_prompt = parts[2].strip() if len(parts) > 2 else None
+            logger.info(f"[CMD] !conversation start by {message.author.name}" + (f" | prompt: {custom_prompt!r}" if custom_prompt else ""))
+            await shared_state.bots["observer"].speak("*Starting a conversation...*")
+            asyncio.create_task(run_conversation(shared_state, starter_prompt=custom_prompt))
+
+    elif sub == "stop":
+        if shared_state.in_conversation:
+            logger.info(f"[CMD] !conversation stop triggered by {message.author.name}")
+            shared_state.stop_conversation = True
+            await shared_state.bots["observer"].speak("*The conversation will end after the next turn.*")
+        else:
+            await message.channel.send("No conversation is running.")
+
+    elif sub == "clear":
+        if shared_state.in_conversation:
+            await message.channel.send("Stop the conversation first before clearing.")
+            return
+        observer_bot = shared_state.bots["observer"]
+        channel = observer_bot.get_channel(CONVERSATION_CHANNEL_ID)
+        if channel:
+            deleted = await channel.purge(limit=None)
+            logger.info(f"[CMD] !conversation clear by {message.author.name} — deleted {len(deleted)} messages")
+
+    else:
+        await message.channel.send(
+            "**Conversation commands:**\n"
+            "`!conversation start` — Begin an autonomous conversation with a random prompt\n"
+            "`!conversation start <question>` — Begin a conversation on a specific topic\n"
+            "`!conversation stop` — Stop after the current turn\n"
+            "`!conversation clear` — Delete all messages in this channel"
+        )
+
+
+async def handle_chess_command(shared_state: SharedState, message: discord.Message):
+    """
+    Route !chess sub-commands:
+      !chess challenge <persona> [white|black]      — human vs AI
+      !chess challenge <persona1> <persona2>        — AI vs AI
+      !chess move <move>
+      !chess board
+      !chess resign
+      !chess status
+    """
+    channel = message.channel
+    parts = message.content.strip().split()
+    sub = parts[1].lower() if len(parts) > 1 else "help"
+
+    # ── challenge ────────────────────────────────────────────────────────────
+    if sub == "challenge":
+        if shared_state.chess_game:
+            g = shared_state.chess_game
+            await channel.send(
+                f"A game is already in progress: **{g.white_name}** vs **{g.black_name}**. "
+                f"Use `!chess resign` to end it first."
+            )
+            return
+
+        arg2 = parts[2].lower() if len(parts) > 2 else ""
+        arg3 = parts[3].lower() if len(parts) > 3 else ""
+
+        persona1_key = _resolve_persona_key(arg2)
+        if not persona1_key:
+            names = ", ".join(p["name"] for p in PERSONAS.values())
+            await channel.send(f"Unknown persona `{arg2}`. Available: {names}")
+            return
+
+        persona2_key = _resolve_persona_key(arg3) if arg3 else None
+
+        # ── AI vs AI ──────────────────────────────────────────────────────
+        if persona2_key:
+            p1_name = PERSONAS[persona1_key]["name"]
+            p2_name = PERSONAS[persona2_key]["name"]
+            p1_emoji = PERSONAS[persona1_key]["avatar_emoji"]
+            p2_emoji = PERSONAS[persona2_key]["avatar_emoji"]
+
+            game = ChessGame(
+                white_name=p1_name,
+                black_name=p2_name,
+                white_persona_key=persona1_key,
+                black_persona_key=persona2_key,
+                human_name=None,
+            )
+            shared_state.chess_game = game
+
+            board_str = game.render_board(flip=False)
+            await channel.send(
+                f"♟️ **AI vs AI chess!**\n"
+                f"{p1_emoji} {p1_name} (White) vs {p2_emoji} {p2_name} (Black)\n"
+                f"{board_str}\n"
+                f"Use `!chess resign` to stop the game."
+            )
+            await asyncio.sleep(random.uniform(2, 4))
+            await make_ai_chess_move(shared_state)
+
+        # ── Human vs AI ───────────────────────────────────────────────────
+        else:
+            if arg3 == "white":
+                human_color = chess.WHITE
+            elif arg3 == "black":
+                human_color = chess.BLACK
+            else:
+                human_color = random.choice([chess.WHITE, chess.BLACK])
+
+            human_display = message.author.display_name
+            persona_name = PERSONAS[persona1_key]["name"]
+            persona_emoji = PERSONAS[persona1_key]["avatar_emoji"]
+
+            if human_color == chess.WHITE:
+                game = ChessGame(
+                    white_name=human_display,
+                    black_name=persona_name,
+                    white_persona_key=None,
+                    black_persona_key=persona1_key,
+                    human_name=human_display,
+                )
+            else:
+                game = ChessGame(
+                    white_name=persona_name,
+                    black_name=human_display,
+                    white_persona_key=persona1_key,
+                    black_persona_key=None,
+                    human_name=human_display,
+                )
+            shared_state.chess_game = game
+
+            color_label = "White ♙" if human_color == chess.WHITE else "Black ♟"
+            ai_color_label = "Black ♟" if human_color == chess.WHITE else "White ♙"
+            flip = human_color == chess.BLACK
+            board_str = game.render_board(flip=flip)
+
+            await channel.send(
+                f"♟️ **Chess game started!**\n"
+                f"{human_display} ({color_label}) vs "
+                f"{persona_emoji} {persona_name} ({ai_color_label})\n"
+                f"{board_str}\n"
+                f"Moves: `!chess move e4` | `!chess board` | `!chess resign`"
+            )
+
+            if game.is_ai_turn:
+                await asyncio.sleep(random.uniform(2, 4))
+                await make_ai_chess_move(shared_state)
+
+    # ── move ─────────────────────────────────────────────────────────────────
+    elif sub == "move":
+        game = shared_state.chess_game
+        if not game:
+            await channel.send("No chess game in progress. Start one with `!chess challenge <persona>`.")
+            return
+
+        if game.is_ai_vs_ai:
+            await channel.send("This is an AI vs AI game — no human moves!")
+            return
+
+        if message.author.display_name != game.human_name:
+            await channel.send(f"Only **{game.human_name}** is playing in this game.")
+            return
+
+        if not game.is_human_turn:
+            await channel.send(f"It's **{game.current_name}**'s turn — please wait.")
+            return
+
+        if len(parts) < 3:
+            await channel.send("Usage: `!chess move <move>` (e.g. `!chess move e4`)")
+            return
+
+        move_str = parts[2]
+        success, result = game.try_move(move_str)
+        if not success:
+            legal = game.get_legal_moves_san()
+            await channel.send(
+                f"{result}\nLegal moves: {', '.join(legal[:20])}"
+                + (" ..." if len(legal) > 20 else "")
+            )
+            return
+
+        flip = game.white_persona_key is not None  # human plays black → flip
+        board_str = game.render_board(flip=flip)
+        status = game.status()
+
+        if game.is_over():
+            await channel.send(f"You played **{result}**\n{board_str}\n\n🏁 {game.result_description()}")
+            shared_state.chess_game = None
+            return
+
+        check_notice = " — **Check!** ♟️" if status == "check" else ""
+        await channel.send(f"You played **{result}**{check_notice}\n{board_str}")
+
+        await asyncio.sleep(random.uniform(2, 5))
+        await make_ai_chess_move(shared_state)
+
+    # ── board ─────────────────────────────────────────────────────────────────
+    elif sub == "board":
+        game = shared_state.chess_game
+        if not game:
+            await channel.send("No chess game in progress.")
+            return
+        flip = (not game.is_ai_vs_ai) and game.white_persona_key is not None
+        board_str = game.render_board(flip=flip)
+        status = game.status()
+        check_notice = " (Check!)" if status == "check" else ""
+        await channel.send(
+            f"**Current board**{check_notice} — {game.current_turn_label} to move\n{board_str}"
+        )
+
+    # ── clear ─────────────────────────────────────────────────────────────────
+    elif sub == "clear":
+        if shared_state.chess_game:
+            await channel.send("Stop the game first before clearing.")
+            return
+        observer_bot = shared_state.bots["observer"]
+        chess_channel = observer_bot.get_channel(CHESS_CHANNEL_ID)
+        if chess_channel:
+            deleted = await chess_channel.purge(limit=None)
+            logger.info(f"[CMD] !chess clear by {message.author.name} — deleted {len(deleted)} messages")
+
+    # ── resign / quit ─────────────────────────────────────────────────────────
+    elif sub in ("resign", "quit"):
+        game = shared_state.chess_game
+        if not game:
+            await channel.send("No chess game in progress.")
+            return
+        white_name, black_name = game.white_name, game.black_name
+        # Pick any bot to announce (first AI found, or white's if AI vs AI)
+        announcer_key = game.white_persona_key or game.black_persona_key
+        shared_state.chess_game = None
+        if game.is_ai_vs_ai:
+            await shared_state.bots[announcer_key].speak(
+                f"The game between **{white_name}** and **{black_name}** has been stopped. ♟️",
+                CHESS_CHANNEL_ID,
+            )
+        else:
+            winner = black_name if game.white_persona_key is None else white_name
+            await shared_state.bots[announcer_key].speak(
+                f"**{game.human_name}** has resigned. {winner} wins! ♟️",
+                CHESS_CHANNEL_ID,
+            )
+
+    # ── status ────────────────────────────────────────────────────────────────
+    elif sub == "status":
+        game = shared_state.chess_game
+        if not game:
+            await channel.send("No chess game in progress.")
+            return
+        status = game.status()
+        legal = game.get_legal_moves_san()
+        mode = "AI vs AI" if game.is_ai_vs_ai else "Human vs AI"
+        await channel.send(
+            f"**{game.white_name}** (White) vs **{game.black_name}** (Black) [{mode}]\n"
+            f"Move {game.move_count + 1} | Status: {status} | Turn: {game.current_turn_label}\n"
+            f"Legal moves ({len(legal)}): {', '.join(legal[:15])}"
+            + (" ..." if len(legal) > 15 else "")
+        )
+
+    # ── help / unknown ────────────────────────────────────────────────────────
+    else:
+        persona_names = " | ".join(p["name"].lower() for p in PERSONAS.values())
+        await channel.send(
+            "**Chess commands:**\n"
+            f"`!chess challenge <persona> [white|black]` — Play against an AI (personas: {persona_names})\n"
+            f"`!chess challenge <persona1> <persona2>` — Watch two AIs play each other\n"
+            "`!chess move <move>` — Make your move (SAN or UCI, e.g. `e4`, `Nf3`, `e2e4`)\n"
+            "`!chess board` — Show the current board\n"
+            "`!chess status` — Show game info and legal moves\n"
+            "`!chess resign` / `!chess quit` — Forfeit or stop the game immediately\n"
+            "`!chess clear` — Delete all messages in this channel"
+        )
+
+
+async def orchestrator(shared_state: SharedState):
+    """Waits for all bots to connect. Conversations are started manually via !conversation start."""
+    logger.info("Orchestrator waiting for all bots to connect...")
+    await shared_state.all_ready.wait()
+    logger.info("All bots ready. Use !conversation start to begin a conversation.")
+
+
+
+async def main():
+    shared_state = SharedState()
+
+    # Verify Ollama is up before starting bots
+    if not shared_state.ollama.is_available():
+        logger.error("Ollama is not running. Start Ollama before launching the bots.")
+        return
+
+    available_models = shared_state.ollama.list_models()
+    logger.info(f"Available Ollama models: {available_models}")
+
+    # Load tokens and build persona bot instances
+    bots_to_run: list[tuple[discord.Client, str]] = []
+    for key, persona in PERSONAS.items():
+        token_env = persona.get("token_env_var")
+        token = os.getenv(token_env) if token_env else None
+        if not token:
+            logger.error(
+                f"Missing token for {persona['name']}. "
+                f"Set {token_env} in your .env file."
+            )
+            return
+        bots_to_run.append((PersonaBot(key, shared_state), token))
+
+    # Run all persona bots and the orchestrator concurrently
+    await asyncio.gather(
+        *[bot.start(token) for bot, token in bots_to_run],
+        orchestrator(shared_state)
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
