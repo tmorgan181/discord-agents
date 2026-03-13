@@ -426,9 +426,9 @@ async def run_conversation(shared_state: SharedState, starter_prompt: str | None
             logger.info(f"[CONVO START] Mode: {mode_name} | Participants: {participant_names}")
             logger.info(f"[CONVO START] Prompt: {conv.starter_prompt!r}")
 
-            # Observer opens every conversation with the starter prompt
-            await shared_state.bots["observer"].speak(conv.starter_prompt)
-            conv.add_message("observer", conv.starter_prompt)
+            # Facilitator opens every conversation with the starter prompt
+            await shared_state.bots["facilitator"].speak(conv.starter_prompt)
+            conv.add_message("facilitator", conv.starter_prompt)
 
             # Conversation loop — addressed_persona and its decaying boost carry
             # forward so the weighted speaker selection factors in who was called out
@@ -469,9 +469,12 @@ async def run_conversation(shared_state: SharedState, starter_prompt: str | None
                 )
 
                 response = _clean_response(response, participants=conv.participants)
+                if not response:
+                    logger.warning(f"{persona['name']} returned empty response — skipping turn")
+                    continue
                 # If the response was truncated mid-sentence, mark it so the next
                 # speaker doesn't try to complete it
-                if response and response[-1] not in '.?!…"\'':
+                if response[-1] not in '.?!…"\'':
                     response += '…'
                 conv.add_message(speaker_key, response)
                 logger.info(f"[TURN {conv.turn_count}/{MAX_CONVERSATION_TURNS}] {persona['name']}: {response.strip()!r}")
@@ -493,7 +496,7 @@ async def run_conversation(shared_state: SharedState, starter_prompt: str | None
 
             logger.info(f"[CONVO END] {conv.turn_count} turns | Mode: {conv.mode} | Duration: {(datetime.now() - conv.started_at).seconds}s")
             shared_state.conversation_manager.end_conversation()
-            await shared_state.bots["observer"].speak(f"*The Atrium falls silent after {conv.turn_count} exchanges.*")
+            await shared_state.bots["facilitator"].speak(f"*The Atrium falls silent after {conv.turn_count} exchanges.*")
 
         except Exception as e:
             logger.error(f"Error during conversation: {e}", exc_info=True)
@@ -645,14 +648,14 @@ async def handle_conversation_command(shared_state: SharedState, message: discor
         else:
             custom_prompt = parts[2].strip() if len(parts) > 2 else None
             logger.info(f"[CMD] !conversation start by {message.author.name}" + (f" | prompt: {custom_prompt!r}" if custom_prompt else ""))
-            await shared_state.bots["observer"].speak("*Starting a conversation...*")
+            await shared_state.bots["facilitator"].speak("*Starting a conversation...*")
             asyncio.create_task(run_conversation(shared_state, starter_prompt=custom_prompt))
 
     elif sub == "stop":
         if shared_state.in_conversation:
             logger.info(f"[CMD] !conversation stop triggered by {message.author.name}")
             shared_state.stop_conversation = True
-            await shared_state.bots["observer"].speak("*The conversation will end after the next turn.*")
+            await shared_state.bots["facilitator"].speak("*The conversation will end after the next turn.*")
         else:
             await message.channel.send("No conversation is running.")
 

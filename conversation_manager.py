@@ -144,7 +144,7 @@ class ConversationManager:
         """Start a random conversation with all personas."""
         mode_key = random.choice(list(CONVERSATION_MODES.keys()))
 
-        participants = list(PERSONAS.keys())
+        participants = [k for k in PERSONAS.keys() if PERSONAS[k].get("participates_in_dialectic", True)]
         random.shuffle(participants)
         if starter_prompt is None:
             starter_prompt = random.choice(CONVERSATION_MODES[mode_key]["starter_prompts"])

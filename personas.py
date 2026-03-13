@@ -43,6 +43,14 @@ PERSONAS = {
         "model": "deepseek-r1",
         "token_env_var": "DISCORD_TOKEN_DEEPSEEK",
         "avatar_emoji": "🔬",
+    },
+    
+    "facilitator": {
+        "name": "Facilitator",
+        "model": "facilitator",
+        "token_env_var": "DISCORD_TOKEN_FACILITATOR",
+        "avatar_emoji": "🤖",
+        "participates_in_dialectic": False,
     }
 }
 
