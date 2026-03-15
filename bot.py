@@ -21,9 +21,12 @@ from dotenv import load_dotenv
 from ollama_client import OllamaClient
 from conversation_manager import ConversationManager
 from personas import PERSONAS, CONVERSATION_MODES
+from memory_manager import inject_memories, store_conversation_for_agent
 
 from chess_game import ChessGame
 import chess
+
+from realm_game import RealmGame, WIN_TERRITORIES, MAX_TURNS
 
 ATRIUM_SYSTEM_PROMPT = (
     "You are one of several AI agents sharing a Discord server called the Atrium,"
@@ -59,11 +62,13 @@ _console_handler.setFormatter(_fmt)
 
 logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 logger.info(f"Logging to {_LOG_FILE}")
 
 OLLAMA_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
 CONVERSATION_CHANNEL_ID = int(os.getenv('CONVERSATION_CHANNEL_ID', 0))
 CHESS_CHANNEL_ID = int(os.getenv('CHESS_CHANNEL_ID', 0)) or CONVERSATION_CHANNEL_ID
+REALM_CHANNEL_ID = int(os.getenv('REALM_CHANNEL_ID', 0)) or CONVERSATION_CHANNEL_ID
 MIN_INTERVENTION_SECONDS = int(os.getenv('MIN_INTERVENTION_SECONDS', 1800))
 MAX_INTERVENTION_SECONDS = int(os.getenv('MAX_INTERVENTION_SECONDS', 10800))
 CONVERSATION_PROBABILITY = float(os.getenv('CONVERSATION_PROBABILITY', 0.7))
@@ -88,6 +93,8 @@ class SharedState:
         self.all_ready = asyncio.Event()
         # Active chess game (one game at a time)
         self.chess_game: ChessGame | None = None
+        # Active realm game
+        self.realm_game: RealmGame | None = None
 
     def register_bot(self, key: str, bot: 'PersonaBot'):
         self.bots[key] = bot
@@ -141,6 +148,15 @@ class PersonaBot(discord.Client):
                 await handle_chess_command(self.shared_state, message)
             return
 
+        # Realm channel: only handle !realm commands, ignore everything else
+        if message.channel.id == REALM_CHANNEL_ID and REALM_CHANNEL_ID != CONVERSATION_CHANNEL_ID:
+            if message.id in self.shared_state.processed_human_messages:
+                return
+            self.shared_state.processed_human_messages.add(message.id)
+            if message.content.strip().lower().startswith("!realm"):
+                await handle_realm_command(self.shared_state, message)
+            return
+
         # Only respond in the conversation channel
         if message.channel.id != CONVERSATION_CHANNEL_ID:
             return
@@ -163,6 +179,11 @@ class PersonaBot(discord.Client):
         # !conversation commands
         if message.content.strip().lower().startswith("!conversation"):
             await handle_conversation_command(self.shared_state, message)
+            return
+
+        # !realm commands
+        if message.content.strip().lower().startswith("!realm"):
+            await handle_realm_command(self.shared_state, message)
             return
 
         conv = self.shared_state.conversation_manager.get_active_conversation()
@@ -305,6 +326,7 @@ def build_system_prompt(persona_key: str, participants: list[str], last_speaker_
     if last_speaker_key and last_speaker_key != persona_key:
         last_name = PERSONAS[last_speaker_key]["name"]
         base += f"\n\nThe last message was from {last_name}."
+    base = inject_memories(persona_name, base)
     return base
 
 
@@ -495,6 +517,20 @@ async def run_conversation(shared_state: SharedState, starter_prompt: str | None
                         logger.info(f"[ADDRESS] Decayed boost for {PERSONAS[addressed]['name']} → {addressed_boost:.1f}")
 
             logger.info(f"[CONVO END] {conv.turn_count} turns | Mode: {conv.mode} | Duration: {(datetime.now() - conv.started_at).seconds}s")
+
+            # Capture conversation data before end_conversation() clears it, then
+            # fire per-agent summarization as background tasks (slow models won't block).
+            for agent_key in conv.participants:
+                persona = PERSONAS[agent_key]
+                asyncio.create_task(store_conversation_for_agent(
+                    agent_key=agent_key,
+                    agent_name=persona["name"],
+                    model=persona["model"],
+                    conv_state=conv,
+                    personas=PERSONAS,
+                    ollama_client=shared_state.ollama,
+                ))
+
             shared_state.conversation_manager.end_conversation()
             await shared_state.bots["facilitator"].speak(f"*The Atrium falls silent after {conv.turn_count} exchanges.*")
 
@@ -677,6 +713,234 @@ async def handle_conversation_command(shared_state: SharedState, message: discor
             "`!conversation stop` — Stop after the current turn\n"
             "`!conversation clear` — Delete all messages in this channel"
         )
+
+
+def _realm_participants() -> list[str]:
+    """Persona keys that play Realm (excludes non-dialectic bots like the facilitator)."""
+    return [k for k, p in PERSONAS.items() if p.get("participates_in_dialectic", True)]
+
+
+async def _get_realm_decision(
+    shared_state: SharedState, persona_key: str
+) -> tuple[str, str | None, str]:
+    """
+    Ask a persona to choose a Realm action.
+    Returns (action, target_or_None, reasoning).
+    """
+    game = shared_state.realm_game
+    persona = PERSONAS[persona_key]
+    fname = persona["name"]
+
+    prompt = game.build_realm_prompt(fname)
+    messages = [
+        {"role": "system", "content": ATRIUM_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        # thinking_model=True → send think=False to skip chain-of-thought (faster, structured output doesn't need it)
+        # thinking_model unset → don't send think at all (non-thinking models reject the parameter)
+        think_flag = False if persona.get("thinking_model") else None
+        response = await shared_state.ollama.chat_response(
+            model=persona["model"], messages=messages, temperature=0.8, max_tokens=200,
+            think=think_flag,
+        )
+    except Exception as e:
+        logger.error(f"Realm LLM error ({fname}): {e}", exc_info=True)
+        response = ""
+
+    logger.debug(f"[REALM RESPONSE] {fname}\n{'='*60}\n{response}\n{'='*60}")
+
+    if not response.strip():
+        logger.warning(f"[REALM] {fname} returned empty response — defaulting to TAX")
+        response = "ACTION: TAX\nTARGET: none\nREASONING: Consolidating resources for now."
+
+    action, target, reasoning = game.parse_action(response)
+    logger.info(f"[REALM] {fname} → {action} {target or ''} | {reasoning[:60]}")
+    return action, target, reasoning
+
+
+async def run_realm_turn(shared_state: SharedState):
+    """
+    Collect decisions from all faction bots sequentially (Ollama handles one
+    model at a time — parallel requests cause timeouts with 9 bots), narrate
+    each choice as it arrives, then resolve the turn and post results.
+    """
+    game = shared_state.realm_game
+    if not game or game.is_over():
+        return
+
+    participants = [k for k in _realm_participants() if k in shared_state.bots and PERSONAS[k]["name"] in game.factions]
+    channel_id = REALM_CHANNEL_ID
+
+    decisions: dict[str, tuple[str, str | None]] = {}
+
+    async def _fetch_and_post(key: str):
+        fname = PERSONAS[key]["name"]
+        action, target, reasoning = await _get_realm_decision(shared_state, key)
+        decisions[fname] = (action, target)
+        action_label = f"{action} → {target}" if target else action
+        await shared_state.bots[key].speak(f"**[{action_label}]** {reasoning}", channel_id)
+
+    # ── Ask all bots simultaneously, post each decision as it arrives ─────────
+    await asyncio.gather(*[_fetch_and_post(key) for key in participants])
+
+    # ── Resolve and post results ───────────────────────────────────────────────
+    events = game.resolve_turn(decisions)
+    result_text = "\n".join(events)
+    state_text = game.render_state()
+
+    facilitator = shared_state.bots.get("facilitator")
+    announcer = facilitator or shared_state.bots[participants[0]]
+    await announcer.speak(f"**— Turn {game.turn} resolved —**\n{result_text}\n\n{state_text}", channel_id)
+
+    if game.is_over():
+        await announcer.speak(
+            "⚔️ The Realm game has ended! Use `!realm start` to play again.",
+            channel_id,
+        )
+        shared_state.realm_game = None
+    else:
+        await announcer.speak(
+            f"Use `!realm turn` to advance to turn {game.turn + 1}, "
+            f"or `!realm autoplay` to run the remaining turns automatically.",
+            channel_id,
+        )
+
+
+async def handle_realm_command(shared_state: SharedState, message: discord.Message):
+    """
+    Route !realm sub-commands:
+      !realm start              — start a new game with all participating bots
+      !realm turn               — advance one turn (collect decisions, resolve)
+      !realm autoplay [N]       — auto-advance N turns (default: all remaining)
+      !realm status             — show current game state
+      !realm stop               — end the game immediately
+    """
+    channel = message.channel
+    parts = message.content.strip().split()
+    sub = parts[1].lower() if len(parts) > 1 else "help"
+    facilitator = shared_state.bots.get("facilitator")
+
+    async def facilitator_say(text: str):
+        if facilitator:
+            await facilitator.speak(text, REALM_CHANNEL_ID)
+        else:
+            await channel.send(text)
+
+    # ── start ─────────────────────────────────────────────────────────────────
+    if sub == "start":
+        if shared_state.realm_game:
+            await facilitator_say("A Realm game is already in progress. Use `!realm stop` to end it first.")
+            return
+
+        participants = _realm_participants()
+        faction_names = [PERSONAS[k]["name"] for k in participants if k in shared_state.bots]
+        if len(faction_names) < 2:
+            await facilitator_say("Need at least 2 bots connected to start Realm.")
+            return
+
+        shared_state.realm_game = RealmGame(faction_names)
+        game = shared_state.realm_game
+
+        names_list = " | ".join(
+            f"{PERSONAS[k]['avatar_emoji']} {PERSONAS[k]['name']}"
+            for k in participants if k in shared_state.bots
+        )
+        await facilitator_say(
+            f"⚔️ **Realm begins!**\n"
+            f"Factions: {names_list}\n"
+            f"First to {WIN_TERRITORIES} territories wins (max {MAX_TURNS} turns).\n\n"
+            f"{game.render_state()}\n\n"
+            f"Use `!realm turn` to play a turn, or `!realm autoplay` to run automatically."
+        )
+
+    # ── turn ──────────────────────────────────────────────────────────────────
+    elif sub == "turn":
+        if not shared_state.realm_game:
+            await facilitator_say("No Realm game in progress. Start one with `!realm start`.")
+            return
+        if shared_state.realm_game.is_over():
+            await facilitator_say("The game is already over. Use `!realm start` for a new game.")
+            return
+        asyncio.create_task(run_realm_turn(shared_state))
+
+    # ── autoplay ──────────────────────────────────────────────────────────────
+    elif sub == "autoplay":
+        if not shared_state.realm_game:
+            await facilitator_say("No Realm game in progress. Start one with `!realm start`.")
+            return
+        if shared_state.realm_game.is_over():
+            await facilitator_say("The game is already over. Use `!realm start` for a new game.")
+            return
+
+        try:
+            n_turns = int(parts[2]) if len(parts) > 2 else MAX_TURNS
+        except ValueError:
+            n_turns = MAX_TURNS
+        n_turns = min(n_turns, MAX_TURNS)
+
+        await facilitator_say(f"▶️ Autoplaying up to {n_turns} turns...")
+
+        async def _autoplay():
+            for _ in range(n_turns):
+                if not shared_state.realm_game or shared_state.realm_game.is_over():
+                    break
+                await run_realm_turn(shared_state)
+                if shared_state.realm_game and not shared_state.realm_game.is_over():
+                    await asyncio.sleep(random.uniform(3, 6))
+
+        asyncio.create_task(_autoplay())
+
+    # ── status ────────────────────────────────────────────────────────────────
+    elif sub == "status":
+        game = shared_state.realm_game
+        if not game:
+            await facilitator_say("No Realm game in progress.")
+            return
+        await facilitator_say(game.render_state())
+
+    # ── stop ──────────────────────────────────────────────────────────────────
+    elif sub == "stop":
+        if not shared_state.realm_game:
+            await facilitator_say("No Realm game in progress.")
+            return
+        shared_state.realm_game = None
+        await facilitator_say("⚔️ Realm game stopped.")
+
+    # ── clear ─────────────────────────────────────────────────────────────────
+    elif sub == "clear":
+        if shared_state.realm_game:
+            await channel.send("Stop the game first before clearing (`!realm stop`).")
+            return
+        realm_channel = shared_state.bots["facilitator"].get_channel(REALM_CHANNEL_ID)
+        if realm_channel:
+            deleted = await realm_channel.purge(limit=None)
+            logger.info(f"[CMD] !realm clear by {message.author.name} — deleted {len(deleted)} messages")
+
+    # ── help / unknown ────────────────────────────────────────────────────────
+    else:
+        facilitator = shared_state.bots.get("facilitator")
+        help_text = (
+            "**Realm** — a turn-based strategy game where each bot controls a faction.\n\n"
+            "**Commands:**\n"
+            "`!realm start` — Start a new game (all connected bots join as factions)\n"
+            "`!realm turn` — Play one turn (each bot chooses an action, then resolve)\n"
+            "`!realm autoplay [N]` — Auto-play N turns (default: all remaining)\n"
+            "`!realm status` — Show current standings\n"
+            "`!realm stop` — End the game immediately\n\n"
+            "**Actions each turn:**\n"
+            "`TAX` — collect gold from your territories\n"
+            "`RECRUIT` — spend 3 gold, gain 2 army\n"
+            "`RAID <faction>` — costs 1 gold; defender has 1.5× defense bonus; winner takes 1 territory\n"
+            "`TRADE <faction>` — mutual only: both gain gold based on shared territory; refused = you gain nothing\n\n"
+            "**Territory is zero-sum** — the only way to gain territory is to RAID and win.\n"
+            "**Win:** first to 6 territories, or highest score after 12 turns."
+        )
+        if facilitator:
+            await facilitator.speak(help_text, REALM_CHANNEL_ID)
+        else:
+            await channel.send(help_text)
 
 
 async def handle_chess_command(shared_state: SharedState, message: discord.Message):
@@ -918,7 +1182,7 @@ async def orchestrator(shared_state: SharedState):
     """Waits for all bots to connect. Conversations are started manually via !conversation start."""
     logger.info("Orchestrator waiting for all bots to connect...")
     await shared_state.all_ready.wait()
-    logger.info("All bots ready. Use !conversation start to begin a conversation.")
+    logger.info("All bots ready.")
 
 
 

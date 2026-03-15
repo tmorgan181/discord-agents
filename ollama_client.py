@@ -29,7 +29,7 @@ class OllamaClient:
 
     def _post(self, url: str, payload: dict) -> dict:
         """Synchronous POST — always call via run_in_executor."""
-        response = requests.post(url, json=payload, timeout=60)
+        response = requests.post(url, json=payload, timeout=180)
         response.raise_for_status()
         return response.json()
 
@@ -38,7 +38,7 @@ class OllamaClient:
         import json, sys
         payload = {**payload, "stream": True}
         full = []
-        with requests.post(url, json=payload, stream=True, timeout=120) as resp:
+        with requests.post(url, json=payload, stream=True, timeout=180) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line:
@@ -100,7 +100,8 @@ class OllamaClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.8,
         max_tokens: int = 500,
-        stream: bool = False
+        stream: bool = False,
+        think: bool | None = None,
     ) -> str:
         payload = {
             "model": model,
@@ -111,6 +112,8 @@ class OllamaClient:
                 "num_predict": max_tokens
             }
         }
+        if think is not None:
+            payload["think"] = think
         last_user = next(
             (m["content"][:80] for m in reversed(messages) if m["role"] != "system"),
             ""

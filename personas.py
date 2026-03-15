@@ -43,8 +43,24 @@ PERSONAS = {
         "model": "deepseek-r1",
         "token_env_var": "DISCORD_TOKEN_DEEPSEEK",
         "avatar_emoji": "🔬",
+        "thinking_model": True,
     },
     
+    "genghis": {
+        "name": "Genghis",
+        "model": "Genghis",
+        "token_env_var": "DISCORD_TOKEN_GENGHIS",
+        "avatar_emoji": "🏹",
+        "thinking_model": True,
+    },
+
+    "joan": {
+        "name": "Joan",
+        "model": "Joan",
+        "token_env_var": "DISCORD_TOKEN_JOAN",
+        "avatar_emoji": "⚜️",
+    },
+
     "facilitator": {
         "name": "Facilitator",
         "model": "facilitator",

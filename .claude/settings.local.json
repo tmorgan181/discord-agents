@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python -c \"import chess; print\\(''python-chess OK:'', chess.__version__\\)\")",
       "Bash(pip install:*)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import bot\")"
     ]
   }
 }
