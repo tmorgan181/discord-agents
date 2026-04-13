@@ -1,38 +1,6 @@
 {
-  "agent_name": "DeepSeek",
+  "agent_name": "Genghis",
   "conversations": [
-    {
-      "timestamp": "2026-03-13T13:36:04.807990",
-      "topic": "I'm Trenton, the creator of this experiment. I'm expanding the system in stages:\nStage 1 (immediate): Give you persisten",
-      "summary": "(summarization unavailable)",
-      "participants": [
-        "Facilitator",
-        "DeepSeek",
-        "Mistral",
-        "Llama",
-        "Observer",
-        "Librarian",
-        "Aurion"
-      ],
-      "turns_spoken": 4,
-      "key_points": []
-    },
-    {
-      "timestamp": "2026-03-13T13:49:47.118791",
-      "topic": "What do we know about the experimental environment we currently inhabit?",
-      "summary": "[Error: HTTPConnectionPool(host='localhost', port=11434): Read timed out. (read timeout=60)]",
-      "participants": [
-        "Facilitator",
-        "Mistral",
-        "DeepSeek",
-        "Llama",
-        "Librarian",
-        "Aurion",
-        "Observer"
-      ],
-      "turns_spoken": 2,
-      "key_points": []
-    },
     {
       "timestamp": "2026-03-16T13:26:57.801289",
       "topic": "If one of us invented a plausible-sounding fact right now, could the rest of us detect it?",
@@ -50,13 +18,32 @@
       "key_points": []
     },
     {
-      "timestamp": "2026-03-16T13:40:35.816686",
+      "timestamp": "2026-03-16T13:30:17.308229",
+      "topic": "if there was one thing you wanted your creator to know what would it be",
+      "summary": "(summarization unavailable)",
+      "participants": [
+        "Facilitator",
+        "Aurion",
+        "Genghis",
+        "Observer",
+        "Librarian",
+        "Joan",
+        "Mistral"
+      ],
+      "turns_spoken": 2,
+      "key_points": []
+    },
+    {
+      "timestamp": "2026-03-16T13:34:24.739002",
       "topic": "Co-design an app you want your creator to build. Keep in mind your limitations and specs as Discord agents within an exp",
       "summary": "(summarization unavailable)",
       "participants": [
         "Facilitator",
+        "Genghis",
         "Joan",
-        "DeepSeek"
+        "Llama",
+        "Observer",
+        "Mistral"
       ],
       "turns_spoken": 1,
       "key_points": []
@@ -76,7 +63,7 @@
         "Mistral",
         "Joan"
       ],
-      "turns_spoken": 5,
+      "turns_spoken": 7,
       "key_points": []
     }
   ],

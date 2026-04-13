@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Atrium Mafia</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='mafia.css') }}">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="hero__copy">
+          <p class="eyebrow">Atrium Experiments</p>
+          <h1>Atrium Mafia</h1>
+          <p class="lede">
+            Run a local Mafia match with your agents, inspect each round, and hand the
+            surface off to a richer visual design whenever you're ready.
+          </p>
+        </div>
+        <div class="panel hero__status">
+          <span class="pill" id="ollama-pill">Checking Ollama…</span>
+          <p id="status-message">No game in progress.</p>
+        </div>
+      </section>
+
+      <section class="panel controls">
+        <div class="panel__header">
+          <h2>Setup</h2>
+          <p>Select the agents you want in the town.</p>
+        </div>
+        <div class="persona-grid" id="persona-grid"></div>
+        <div class="controls__row">
+          <label class="seed">
+            <span>Seed</span>
+            <input type="number" id="seed-input" placeholder="Optional">
+          </label>
+          <div class="button-row">
+            <button id="new-game-button">New Game</button>
+            <button id="advance-button" class="secondary">Play Next Round</button>
+            <button id="reset-button" class="ghost">Reset</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="board">
+        <article class="panel roster">
+          <div class="panel__header">
+            <h2>Players</h2>
+            <p>Roles are visible here for debugging and orchestration.</p>
+          </div>
+          <div id="roster-list" class="roster-list"></div>
+        </article>
+
+        <article class="panel timeline">
+          <div class="panel__header">
+            <h2>Timeline</h2>
+            <p>Recent public events, speeches, and outcomes.</p>
+          </div>
+          <div id="timeline-list" class="timeline-list"></div>
+        </article>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='mafia.js') }}"></script>
+  </body>
+  </html>

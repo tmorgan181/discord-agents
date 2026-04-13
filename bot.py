@@ -27,6 +27,7 @@ from chess_game import ChessGame
 import chess
 
 from realm_game import RealmGame, WIN_TERRITORIES, MAX_TURNS
+from accord_game import AccordGame, MAX_TURNS as ACCORD_MAX_TURNS
 
 ATRIUM_SYSTEM_PROMPT = (
     "You are one of several AI agents sharing a Discord server called the Atrium,"
@@ -56,11 +57,13 @@ _fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 _file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
 _file_handler.setFormatter(_fmt)
+_file_handler.setLevel(logging.DEBUG)   # file captures everything including LLM message traces
 
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(_fmt)
+_console_handler.setLevel(logging.INFO)  # console stays clean
 
-logging.basicConfig(level=logging.INFO, handlers=[_console_handler, _file_handler])
+logging.basicConfig(level=logging.DEBUG, handlers=[_console_handler, _file_handler])
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.info(f"Logging to {_LOG_FILE}")
@@ -69,6 +72,7 @@ OLLAMA_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
 CONVERSATION_CHANNEL_ID = int(os.getenv('CONVERSATION_CHANNEL_ID', 0))
 CHESS_CHANNEL_ID = int(os.getenv('CHESS_CHANNEL_ID', 0)) or CONVERSATION_CHANNEL_ID
 REALM_CHANNEL_ID = int(os.getenv('REALM_CHANNEL_ID', 0)) or CONVERSATION_CHANNEL_ID
+ACCORD_CHANNEL_ID = int(os.getenv('ACCORD_CHANNEL_ID', 0)) or CONVERSATION_CHANNEL_ID
 MIN_INTERVENTION_SECONDS = int(os.getenv('MIN_INTERVENTION_SECONDS', 1800))
 MAX_INTERVENTION_SECONDS = int(os.getenv('MAX_INTERVENTION_SECONDS', 10800))
 CONVERSATION_PROBABILITY = float(os.getenv('CONVERSATION_PROBABILITY', 0.7))
@@ -95,6 +99,8 @@ class SharedState:
         self.chess_game: ChessGame | None = None
         # Active realm game
         self.realm_game: RealmGame | None = None
+        # Active accord game
+        self.accord_game: AccordGame | None = None
 
     def register_bot(self, key: str, bot: 'PersonaBot'):
         self.bots[key] = bot
@@ -139,22 +145,28 @@ class PersonaBot(discord.Client):
         if message.author.bot:
             return
 
-        # Chess channel: only handle !chess commands, ignore everything else
+        # Chess channel: only the Facilitator handles commands here
         if message.channel.id == CHESS_CHANNEL_ID and CHESS_CHANNEL_ID != CONVERSATION_CHANNEL_ID:
-            if message.id in self.shared_state.processed_human_messages:
+            if self.persona_key != "facilitator":
                 return
-            self.shared_state.processed_human_messages.add(message.id)
             if message.content.strip().lower().startswith("!chess"):
                 await handle_chess_command(self.shared_state, message)
             return
 
-        # Realm channel: only handle !realm commands, ignore everything else
+        # Realm channel: only the Facilitator handles commands here
         if message.channel.id == REALM_CHANNEL_ID and REALM_CHANNEL_ID != CONVERSATION_CHANNEL_ID:
-            if message.id in self.shared_state.processed_human_messages:
+            if self.persona_key != "facilitator":
                 return
-            self.shared_state.processed_human_messages.add(message.id)
             if message.content.strip().lower().startswith("!realm"):
                 await handle_realm_command(self.shared_state, message)
+            return
+
+        # Accord channel: only the Facilitator handles commands here
+        if message.channel.id == ACCORD_CHANNEL_ID and ACCORD_CHANNEL_ID != CONVERSATION_CHANNEL_ID:
+            if self.persona_key != "facilitator":
+                return
+            if message.content.strip().lower().startswith("!accord"):
+                await handle_accord_command(self.shared_state, message)
             return
 
         # Only respond in the conversation channel
@@ -186,6 +198,11 @@ class PersonaBot(discord.Client):
             await handle_realm_command(self.shared_state, message)
             return
 
+        # !accord commands
+        if message.content.strip().lower().startswith("!accord"):
+            await handle_accord_command(self.shared_state, message)
+            return
+
         conv = self.shared_state.conversation_manager.get_active_conversation()
         if conv and self.shared_state.in_conversation:
             conv.add_human_message(message.author.name, message.content)
@@ -212,7 +229,10 @@ class PersonaBot(discord.Client):
         target = channel_id or CONVERSATION_CHANNEL_ID
         channel = self.get_channel(target)
         if channel:
-            await channel.send(content)
+            try:
+                await channel.send(content)
+            except discord.errors.Forbidden:
+                logger.error(f"{self.persona['name']} missing Send Messages permission in channel {target}")
         else:
             logger.error(f"{self.persona['name']} could not find channel {target}")
 
@@ -702,8 +722,11 @@ async def handle_conversation_command(shared_state: SharedState, message: discor
         observer_bot = shared_state.bots["observer"]
         channel = observer_bot.get_channel(CONVERSATION_CHANNEL_ID)
         if channel:
-            deleted = await channel.purge(limit=None)
-            logger.info(f"[CMD] !conversation clear by {message.author.name} — deleted {len(deleted)} messages")
+            try:
+                deleted = await channel.purge(limit=None)
+                logger.info(f"[CMD] !conversation clear by {message.author.name} — deleted {len(deleted)} messages")
+            except discord.errors.Forbidden:
+                await message.channel.send("Missing Permissions — grant the bot **Manage Messages** in this channel.")
 
     else:
         await message.channel.send(
@@ -716,8 +739,66 @@ async def handle_conversation_command(shared_state: SharedState, message: discor
 
 
 def _realm_participants() -> list[str]:
-    """Persona keys that play Realm (excludes non-dialectic bots like the facilitator)."""
-    return [k for k, p in PERSONAS.items() if p.get("participates_in_dialectic", True)]
+    """Persona keys that play Realm (only those with realm_player: True)."""
+    return [k for k, p in PERSONAS.items() if p.get("realm_player", False)]
+
+
+async def _get_realm_diplomacy(shared_state: SharedState, persona_key: str) -> str:
+    """Ask a persona for a short diplomatic statement. Returns the raw text."""
+    game = shared_state.realm_game
+    persona = PERSONAS[persona_key]
+    fname = persona["name"]
+
+    prompt = game.build_diplomacy_prompt(fname)
+    messages = [
+        {"role": "system", "content": "You are playing a competitive strategy game. Be direct, specific, and in character. This is not a casual conversation — every word is a move."},
+        {"role": "user", "content": prompt},
+    ]
+    think_flag = False if persona.get("thinking_model") else None
+    try:
+        response = await shared_state.ollama.chat_response(
+            model=persona["model"], messages=messages, temperature=0.9, max_tokens=80,
+            think=think_flag,
+        )
+    except Exception as e:
+        logger.error(f"Realm diplomacy error ({fname}): {e}")
+        response = ""
+    return response.strip()
+
+
+REALM_GAME_SYSTEM = (
+    "You are playing a competitive strategy game. Be direct, specific, and in character. "
+    "This is not a casual conversation — every move has consequences."
+)
+
+
+async def _get_realm_reasoning(
+    shared_state: SharedState, persona_key: str
+) -> str:
+    """
+    Private reasoning pass — bot thinks through strategy before committing.
+    Result is logged but never posted to Discord or shared with other bots.
+    """
+    game = shared_state.realm_game
+    persona = PERSONAS[persona_key]
+    fname = persona["name"]
+
+    prompt = game.build_reasoning_prompt(fname)
+    messages = [
+        {"role": "system", "content": REALM_GAME_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        response = await shared_state.ollama.chat_response(
+            model=persona["model"], messages=messages, temperature=0.85, max_tokens=300,
+        )
+    except Exception as e:
+        logger.error(f"Realm reasoning error ({fname}): {e}")
+        response = ""
+
+    if response.strip():
+        logger.info(f"[REALM PRIVATE] {fname}\n{'-'*50}\n{response.strip()}\n{'-'*50}")
+    return response.strip()
 
 
 async def _get_realm_decision(
@@ -725,25 +806,26 @@ async def _get_realm_decision(
 ) -> tuple[str, str | None, str]:
     """
     Ask a persona to choose a Realm action.
+    First does a private reasoning pass, then commits to a structured decision.
     Returns (action, target_or_None, reasoning).
     """
     game = shared_state.realm_game
     persona = PERSONAS[persona_key]
     fname = persona["name"]
 
-    prompt = game.build_realm_prompt(fname)
+    # Step 1: private reasoning (logged, not posted)
+    reasoning_text = await _get_realm_reasoning(shared_state, persona_key)
+
+    # Step 2: action decision informed by that reasoning
+    prompt = game.build_realm_prompt(fname, reasoning=reasoning_text)
     messages = [
-        {"role": "system", "content": ATRIUM_SYSTEM_PROMPT},
+        {"role": "system", "content": REALM_GAME_SYSTEM},
         {"role": "user", "content": prompt},
     ]
 
     try:
-        # thinking_model=True → send think=False to skip chain-of-thought (faster, structured output doesn't need it)
-        # thinking_model unset → don't send think at all (non-thinking models reject the parameter)
-        think_flag = False if persona.get("thinking_model") else None
         response = await shared_state.ollama.chat_response(
-            model=persona["model"], messages=messages, temperature=0.8, max_tokens=200,
-            think=think_flag,
+            model=persona["model"], messages=messages, temperature=0.7, max_tokens=200,
         )
     except Exception as e:
         logger.error(f"Realm LLM error ({fname}): {e}", exc_info=True)
@@ -773,6 +855,20 @@ async def run_realm_turn(shared_state: SharedState):
     participants = [k for k in _realm_participants() if k in shared_state.bots and PERSONAS[k]["name"] in game.factions]
     channel_id = REALM_CHANNEL_ID
 
+    # ── Diplomacy phase — two rounds, forward then reverse ────────────────────
+    game.diplomacy_log.clear()
+
+    async def _diplo_and_post(key: str):
+        fname = PERSONAS[key]["name"]
+        statement = await _get_realm_diplomacy(shared_state, key)
+        if statement:
+            game.diplomacy_log.append(f"{fname}: {statement}")
+            await shared_state.bots[key].speak(statement, channel_id)
+
+    for key in participants:
+        await _diplo_and_post(key)
+
+    # ── Action phase — all bots decide simultaneously ─────────────────────────
     decisions: dict[str, tuple[str, str | None]] = {}
 
     async def _fetch_and_post(key: str):
@@ -782,7 +878,6 @@ async def run_realm_turn(shared_state: SharedState):
         action_label = f"{action} → {target}" if target else action
         await shared_state.bots[key].speak(f"**[{action_label}]** {reasoning}", channel_id)
 
-    # ── Ask all bots simultaneously, post each decision as it arrives ─────────
     await asyncio.gather(*[_fetch_and_post(key) for key in participants])
 
     # ── Resolve and post results ───────────────────────────────────────────────
@@ -915,8 +1010,11 @@ async def handle_realm_command(shared_state: SharedState, message: discord.Messa
             return
         realm_channel = shared_state.bots["facilitator"].get_channel(REALM_CHANNEL_ID)
         if realm_channel:
-            deleted = await realm_channel.purge(limit=None)
-            logger.info(f"[CMD] !realm clear by {message.author.name} — deleted {len(deleted)} messages")
+            try:
+                deleted = await realm_channel.purge(limit=None)
+                logger.info(f"[CMD] !realm clear by {message.author.name} — deleted {len(deleted)} messages")
+            except discord.errors.Forbidden:
+                await message.channel.send("Missing Permissions — grant Facilitator **Manage Messages** in this channel.")
 
     # ── help / unknown ────────────────────────────────────────────────────────
     else:
@@ -941,6 +1039,263 @@ async def handle_realm_command(shared_state: SharedState, message: discord.Messa
             await facilitator.speak(help_text, REALM_CHANNEL_ID)
         else:
             await channel.send(help_text)
+
+
+async def run_accord_turn(shared_state: SharedState):
+    game = shared_state.accord_game
+    if not game or game.is_over():
+        return
+
+    participants = [k for k in _realm_participants() if k in shared_state.bots and PERSONAS[k]["name"] in game.factions]
+    random.shuffle(participants)
+    channel_id = ACCORD_CHANNEL_ID
+
+    facilitator = shared_state.bots.get("facilitator")
+
+    async def facilitator_say(text: str):
+        if facilitator:
+            await facilitator.speak(text, channel_id)
+
+    # ── Draw threat ────────────────────────────────────────────────────────────
+    threat = game.draw_threat()
+    game.negotiation_log.clear()
+    await facilitator_say(
+        f"**— Turn {game.turn + 1} —**\n"
+        f"⚠️ **{threat.name}** approaches — {threat.description}"
+    )
+
+    # ── Check for perished factions ────────────────────────────────────────────
+    perished = game.check_perished()
+    for fname, resource in perished:
+        await facilitator_say(
+            f"☠️ **{fname}'s settlement collapses.** Their {resource} reserves were completely depleted — "
+            f"they cannot face a {threat.name} and their district falls silent."
+        )
+        # Remove from active participants
+        participants = [k for k in participants if PERSONAS[k]["name"] != fname]
+
+    if game.is_over():
+        await facilitator_say(game.render_state())
+        shared_state.accord_game = None
+        return
+
+    # ── Scout report — posted by Facilitator ───────────────────────────────────
+    report = game.build_scout_report("__public__")
+    await facilitator_say(report)
+
+    # ── Negotiation phase ──────────────────────────────────────────────────────
+    async def _negotiate(key: str):
+        fname = PERSONAS[key]["name"]
+        prompt = game.build_negotiation_prompt(fname)
+        messages = [
+            {"role": "system", "content": "You are playing The Accord, a cooperative city survival game. Speak in character. Do NOT restate threat requirements or game mechanics — the Facilitator already posted those. Just say what you intend to contribute and coordinate with the other factions."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            response = await shared_state.ollama.chat_response(
+                model=PERSONAS[key]["model"], messages=messages, temperature=0.85, max_tokens=300,
+            )
+        except Exception as e:
+            logger.error(f"Accord negotiation error ({fname}): {e}")
+            response = ""
+        if response.strip():
+            game.negotiation_log.append(f"{fname}: {response.strip()}")
+            await shared_state.bots[key].speak(response.strip(), channel_id)
+
+    for key in participants:
+        await _negotiate(key)
+
+    # ── Commitment phase — reasoning then action ───────────────────────────────
+    commitments: dict[str, tuple[str, str, int]] = {}
+
+    async def _commit(key: str):
+        fname = PERSONAS[key]["name"]
+
+        # Private reasoning
+        r_prompt = game.build_reasoning_prompt(fname)
+        r_messages = [
+            {"role": "system", "content": "You are playing The Accord, a cooperative city survival game. Think privately and strategically about what action to take this turn."},
+            {"role": "user", "content": r_prompt},
+        ]
+        try:
+            reasoning = await shared_state.ollama.chat_response(
+                model=PERSONAS[key]["model"], messages=r_messages, temperature=0.85, max_tokens=750,
+            )
+        except Exception as e:
+            logger.error(f"Accord reasoning error ({fname}): {e}")
+            reasoning = ""
+
+        if reasoning.strip():
+            logger.info(f"[ACCORD PRIVATE] {fname}\n{'-'*50}\n{reasoning.strip()}\n{'-'*50}")
+
+        # Action decision — pass what others have already committed so far
+        a_prompt = game.build_commitment_prompt(fname, reasoning=reasoning.strip(), committed_so_far=dict(commitments))
+        a_messages = [
+            {"role": "system", "content": "You are playing The Accord, a cooperative city survival game. Reply with your action decision in the exact format requested. Nothing else."},
+            {"role": "user", "content": a_prompt},
+        ]
+        try:
+            response = await shared_state.ollama.chat_response(
+                model=PERSONAS[key]["model"], messages=a_messages, temperature=0.7, max_tokens=450,
+            )
+        except Exception as e:
+            logger.error(f"Accord commitment error ({fname}): {e}")
+            response = ""
+
+        action, resource, amount, reason = game.parse_commitment(response, fname)
+        commitments[fname] = (action, resource, amount)
+
+        if action == "CONTRIBUTE":
+            label = f"**[CONTRIBUTE {amount} {resource}]** {reason}"
+        elif action == "GATHER":
+            label = f"**[GATHER +1 each]** {reason}"
+        elif action == "SCOUT":
+            game.scouted = True
+            t = game.current_threat
+            exact = ", ".join(f"{r}: {v}" for r, v in t.requirements.items()) if t else "?"
+            label = f"**[SCOUT]** {reason}"
+            await shared_state.bots[key].speak(label, channel_id)
+            await facilitator_say(f"Aurion scouts the threat — exact requirements revealed: **{exact}**")
+            commitments[fname] = (action, resource, amount)
+            logger.info(f"[ACCORD] {fname} → SCOUT | {reason[:60]}")
+            return
+        else:
+            label = f"**[GATHER +1 each]** {reason}"
+        await shared_state.bots[key].speak(label, channel_id)
+        logger.info(f"[ACCORD] {fname} → {action} {amount} {resource} | {reason[:60]}")
+
+    # Aurion (scout) always commits first so her SCOUT reveals info before others act
+    aurion_key = next((k for k in participants if PERSONAS[k].get("specialty") == "scout"
+                       or PERSONAS[k]["name"] == "Aurion"), None)
+    ordered = ([aurion_key] if aurion_key else []) + [k for k in participants if k != aurion_key]
+    for key in ordered:
+        await _commit(key)
+
+    # ── Resolve ────────────────────────────────────────────────────────────────
+    events = game.resolve_turn(commitments)
+    await facilitator_say("\n".join(events) + "\n\n" + game.render_state())
+
+    if game.is_over():
+        shared_state.accord_game = None
+
+
+async def handle_accord_command(shared_state: SharedState, message: discord.Message):
+    """
+    Route !accord sub-commands:
+      !accord start            — start a new game
+      !accord turn             — play one turn
+      !accord autoplay [N]     — auto-advance N turns (default: all remaining)
+      !accord status           — show current state
+      !accord stop             — end the game
+    """
+    channel = message.channel
+    parts = message.content.strip().split()
+    sub = parts[1].lower() if len(parts) > 1 else "help"
+
+    facilitator = shared_state.bots.get("facilitator")
+
+    async def facilitator_say(text: str):
+        if facilitator:
+            await facilitator.speak(text, ACCORD_CHANNEL_ID)
+        else:
+            await channel.send(text)
+
+    # ── start ──────────────────────────────────────────────────────────────────
+    if sub == "start":
+        if shared_state.accord_game:
+            await facilitator_say("An Accord game is already in progress. Use `!accord stop` to end it first.")
+            return
+        participants = _realm_participants()
+        faction_names = [PERSONAS[k]["name"] for k in participants if k in shared_state.bots]
+        if len(faction_names) < 2:
+            await facilitator_say("Need at least 2 connected bots to start.")
+            return
+        shared_state.accord_game = AccordGame(faction_names)
+        game = shared_state.accord_game
+        intro = (
+            f"🏰 **The Accord begins!**\n"
+            f"Factions: {', '.join(f'**{n}**' for n in faction_names)}\n"
+            f"City HP: {game.city_hp}/{game.city_hp} — survive {ACCORD_MAX_TURNS} turns.\n\n"
+            f"{game.render_state()}\n\n"
+            f"Use `!accord turn` to play a turn, or `!accord autoplay` to run automatically."
+        )
+        await facilitator_say(intro)
+
+    # ── turn ───────────────────────────────────────────────────────────────────
+    elif sub == "turn":
+        if not shared_state.accord_game:
+            await facilitator_say("No Accord game in progress. Start one with `!accord start`.")
+            return
+        if shared_state.accord_game.is_over():
+            await facilitator_say("The game is already over. Use `!accord start` for a new game.")
+            return
+        asyncio.create_task(run_accord_turn(shared_state))
+
+    # ── autoplay ───────────────────────────────────────────────────────────────
+    elif sub == "autoplay":
+        if not shared_state.accord_game:
+            await facilitator_say("No Accord game in progress. Start one with `!accord start`.")
+            return
+        if shared_state.accord_game.is_over():
+            await facilitator_say("The game is already over. Use `!accord start` for a new game.")
+            return
+        try:
+            n = int(parts[2]) if len(parts) > 2 else ACCORD_MAX_TURNS
+        except ValueError:
+            n = ACCORD_MAX_TURNS
+
+        async def _autoplay():
+            for _ in range(n):
+                if not shared_state.accord_game or shared_state.accord_game.is_over():
+                    break
+                await run_accord_turn(shared_state)
+                if shared_state.accord_game and not shared_state.accord_game.is_over():
+                    await asyncio.sleep(random.uniform(3, 6))
+
+        asyncio.create_task(_autoplay())
+
+    # ── status ─────────────────────────────────────────────────────────────────
+    elif sub == "status":
+        if not shared_state.accord_game:
+            await facilitator_say("No Accord game in progress.")
+            return
+        await facilitator_say(shared_state.accord_game.render_state())
+
+    # ── stop ───────────────────────────────────────────────────────────────────
+    elif sub == "stop":
+        if not shared_state.accord_game:
+            await facilitator_say("No Accord game in progress.")
+            return
+        shared_state.accord_game = None
+        await facilitator_say("🏰 Accord game stopped.")
+
+    # ── clear ──────────────────────────────────────────────────────────────────
+    elif sub == "clear":
+        if shared_state.accord_game:
+            await channel.send("Stop the game first before clearing (`!accord stop`).")
+            return
+        try:
+            deleted = await message.channel.purge(limit=None)
+            logger.info(f"[CMD] !accord clear by {message.author.name} — deleted {len(deleted)} messages")
+        except discord.errors.Forbidden:
+            await message.channel.send("Missing Permissions — grant Facilitator **Manage Messages** in this channel.")
+
+    # ── help / unknown ─────────────────────────────────────────────────────────
+    else:
+        await facilitator_say(
+            "**The Accord** — cooperative city survival.\n\n"
+            "**Commands:**\n"
+            "`!accord start` — Start a new game\n"
+            "`!accord turn` — Play one turn (negotiate → commit → resolve)\n"
+            "`!accord autoplay [N]` — Auto-play N turns (default: all remaining)\n"
+            "`!accord status` — Show current city state\n"
+            "`!accord stop` — End the game\n"
+            "`!accord clear` — Purge all messages from the channel\n\n"
+            "**Each turn:** A threat is drawn. Factions negotiate, then each commits resources.\n"
+            "Pool your contributions to meet the threat threshold or the city takes damage.\n\n"
+            "**Resources:** food · stone · army · gold (wildcard, 2:1)\n"
+            "**Specialties:** Genghis=army×1.5 · Joan=morale+10% · Aurion=scout · Itrion=gold×1"
+        )
 
 
 async def handle_chess_command(shared_state: SharedState, message: discord.Message):
@@ -1122,8 +1477,11 @@ async def handle_chess_command(shared_state: SharedState, message: discord.Messa
         observer_bot = shared_state.bots["observer"]
         chess_channel = observer_bot.get_channel(CHESS_CHANNEL_ID)
         if chess_channel:
-            deleted = await chess_channel.purge(limit=None)
-            logger.info(f"[CMD] !chess clear by {message.author.name} — deleted {len(deleted)} messages")
+            try:
+                deleted = await chess_channel.purge(limit=None)
+                logger.info(f"[CMD] !chess clear by {message.author.name} — deleted {len(deleted)} messages")
+            except discord.errors.Forbidden:
+                await message.channel.send("Missing Permissions — grant the bot **Manage Messages** in this channel.")
 
     # ── resign / quit ─────────────────────────────────────────────────────────
     elif sub in ("resign", "quit"):
@@ -1211,8 +1569,21 @@ async def main():
         bots_to_run.append((PersonaBot(key, shared_state), token))
 
     # Run all persona bots and the orchestrator concurrently
+    async def start_bot(bot: discord.Client, token: str):
+        try:
+            await bot.start(token)
+        except discord.errors.PrivilegedIntentsRequired:
+            name = getattr(bot, 'persona', {}).get('name', str(bot))
+            logger.error(
+                f"{name}: Missing 'Message Content Intent'. "
+                f"Enable it at discord.com/developers/applications → {name} → Bot → Privileged Gateway Intents."
+            )
+        except discord.errors.LoginFailure:
+            name = getattr(bot, 'persona', {}).get('name', str(bot))
+            logger.error(f"{name}: Invalid token. Check {bot.persona_key.upper()} in your .env file.")
+
     await asyncio.gather(
-        *[bot.start(token) for bot, token in bots_to_run],
+        *[start_bot(bot, token) for bot, token in bots_to_run],
         orchestrator(shared_state)
     )
 

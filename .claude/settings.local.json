@@ -4,7 +4,11 @@
       "Bash(python -c \"import chess; print\\(''python-chess OK:'', chess.__version__\\)\")",
       "Bash(pip install:*)",
       "Bash(python -c \":*)",
-      "Bash(python -c \"import bot\")"
+      "Bash(python -c \"import bot\")",
+      "Bash(ollama list:*)",
+      "Bash(ollama create:*)",
+      "Bash(python -c \"from accord_game import AccordGame, MAX_TURNS; from bot import *; print\\(''''OK''''\\)\")",
+      "Bash(python -c \"from accord_game import AccordGame; g = AccordGame\\([''Genghis'',''Joan'',''Aurion'',''Itrion'']\\); g.draw_threat\\(\\); print\\(g.render_state\\(\\)\\); print\\(g.parse_commitment\\(''ACTION: GATHER\\\\nRESOURCE: none\\\\nAMOUNT: 0\\\\nREASONING: low on army'', ''Genghis''\\)\\)\")"
     ]
   }
 }

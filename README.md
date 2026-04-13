@@ -80,6 +80,25 @@ All commands use the prefix `!atrium`
 - `!atrium status` - Check bot and Ollama connection status
 - `!atrium personas` - List all available personas
 
+## 🕵️ Mafia Web App
+
+You can also run the agents through a local Mafia web app:
+
+```bash
+pip install -r requirements.txt
+python mafia_web.py
+```
+
+Then open [http://127.0.0.1:8080](http://127.0.0.1:8080).
+
+What it does:
+- Starts a Mafia match with selected Atrium personas
+- Uses local Ollama models to generate speeches, night actions, and day votes
+- Shows a live round-by-round roster and public event timeline
+
+This UI is intentionally lightweight so it can be redesigned without changing the
+game engine or API surface.
+
 ## 🎭 Personas
 
 **Existing Atrium Models:**

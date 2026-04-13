@@ -1,7 +1,7 @@
 """
 Realm — A turn-based strategy simulation for Discord Atrium bots.
 
-Territory is zero-sum: each faction starts with 2 territories (12 total).
+Territory is zero-sum: each faction starts with 2 territories (8 total with 4 factions).
 The only way to gain territory is to RAID another faction and win.
 
 Actions:
@@ -52,6 +52,7 @@ class RealmGame:
         self.winner: str | None = None
         self.event_history: list[str] = []
         self.faction_actions: dict[str, list[str]] = {name: [] for name in faction_names}
+        self.diplomacy_log: list[str] = []  # current turn's diplomacy, cleared each turn
 
     # ── State ─────────────────────────────────────────────────────────────────
 
@@ -102,14 +103,90 @@ class RealmGame:
 
         return "\n".join(lines)
 
+    # ── Diplomacy ──────────────────────────────────────────────────────────────
+
+    def build_diplomacy_prompt(self, faction_name: str) -> str:
+        f = self.factions[faction_name]
+        leader = max(self.factions.values(), key=lambda x: x.territory)
+        prior = "\n".join(f"  {line}" for line in self.diplomacy_log)
+        prior_section = f"\nWHAT OTHERS HAVE SAID SO FAR:\n{prior}\n" if self.diplomacy_log else ""
+
+        return (
+            f"You are {faction_name} in the Realm strategy game. DIPLOMACY PHASE — Turn {self.turn + 1}.\n\n"
+            f"{self.render_state()}\n"
+            f"YOUR RESOURCES: Gold={f.gold}, Army={f.army}, Territory={f.territory}\n"
+            f"Current leader: {leader.name} ({leader.territory} territories)\n"
+            f"{prior_section}\n"
+            f"Make ONE statement directed at a specific faction. Name them. State exactly what you will do or want them to do.\n\n"
+            f"GOOD (specific, credible):\n"
+            f'  "{leader.name} — you are the threat. I am raiding you this turn."\n'
+            f'  "Genghis — stay off my territory and I will TRADE with you."\n'
+            f'  "I am raiding whoever attacks me first."\n\n'
+            f"BAD (do NOT say these):\n"
+            f'  "I propose a mutual alliance for our benefit."\n'
+            f'  "Let us work together toward victory."\n'
+            f'  "I seek friendly relations with everyone."\n\n'
+            f"One sentence. In character. Specific faction named. No vague offers.\n"
+            f"Do NOT reveal your exact action — but make your intent clear."
+        )
+
     # ── Prompt building ────────────────────────────────────────────────────────
+
+    def _diplomacy_section(self, faction_name: str) -> str:
+        own = next(
+            (line.split(":", 1)[1].strip() for line in self.diplomacy_log if line.startswith(f"{faction_name}:")),
+            None,
+        )
+        directed = [line for line in self.diplomacy_log if faction_name in line and not line.startswith(f"{faction_name}:")]
+        lines = ["DIPLOMACY THIS TURN:"]
+        if own:
+            lines.append(f"  YOU SAID: \"{own}\"")
+            lines.append(f"  → Your action should reflect this. If you break your word, say why in REASONING.")
+        if directed:
+            lines.append("  SAID TO YOU:")
+            lines.extend(f"    {line}" for line in directed)
+        others = [line for line in self.diplomacy_log if not line.startswith(f"{faction_name}:") and faction_name not in line]
+        if others:
+            lines.append("  OTHER STATEMENTS:")
+            lines.extend(f"    {line}" for line in others)
+        return "\n".join(lines) + "\n\n"
+
+    def build_reasoning_prompt(self, faction_name: str) -> str:
+        f = self.factions[faction_name]
+        others = {n: fac for n, fac in self.factions.items() if n != faction_name}
+        strategic = self.get_strategic_context(faction_name)
+        history_text = (
+            "\n".join(self.event_history[-6:]) if self.event_history else "No events yet."
+        )
+        diplo_section = self._diplomacy_section(faction_name) if self.diplomacy_log else ""
+
+        other_stats = "\n".join(
+            f"  {n}: Gold={fac.gold}, Army={fac.army}, Territory={fac.territory}"
+            for n, fac in sorted(others.items(), key=lambda x: -x[1].territory)
+        )
+
+        return (
+            f"You are {faction_name} in the Realm strategy game. Turn {self.turn + 1}.\n\n"
+            f"CURRENT STANDINGS:\n{self.render_state()}\n\n"
+            f"YOUR RESOURCES: Gold={f.gold}, Army={f.army}, Territory={f.territory}\n"
+            f"YOUR STRATEGIC POSITION:\n{strategic}\n\n"
+            f"OPPONENTS:\n{other_stats}\n\n"
+            f"{diplo_section}"
+            f"RECENT EVENTS:\n{history_text}\n\n"
+            f"Think through the following privately before you act:\n"
+            f"1. Who is the biggest threat and why?\n"
+            f"2. What do the diplomatic statements reveal about what others will do this turn?\n"
+            f"3. Are you in a position to win, survive, or fall behind — and what does that mean for your move?\n"
+            f"4. What is the single best action available to you right now?\n\n"
+            f"This is your private strategic analysis. No one else will see it. Think freely and be specific."
+        )
 
     def _raid_win_prob(self, attacker_army: int, defender_army: int) -> float:
         effective = defender_army * DEFENDER_BONUS
         total = attacker_army + effective
         return attacker_army / total if total > 0 else 0.5
 
-    def build_realm_prompt(self, faction_name: str) -> str:
+    def build_realm_prompt(self, faction_name: str, reasoning: str = "") -> str:
         f = self.factions[faction_name]
         others = {n: fac for n, fac in self.factions.items() if n != faction_name}
         history_text = (
@@ -148,17 +225,25 @@ class RealmGame:
 
         gold_warning = ""
 
+        reasoning_section = (
+            f"YOUR PRIVATE REASONING (from your earlier analysis):\n{reasoning}\n\n"
+            f"Now commit to your action. Your reasoning above should drive this decision.\n\n"
+            if reasoning else ""
+        )
+
         return (
             f"You are the {faction_name} faction in the Realm strategy game.\n\n"
             f"CURRENT STANDINGS:\n{self.render_state()}\n\n"
             f"YOUR RESOURCES: Gold={f.gold}, Army={f.army}, Territory={f.territory}\n"
             f"YOUR STRATEGIC POSITION:\n{strategic}\n"
             f"{streak_warning}{gold_warning}\n"
-            f"RECENT EVENTS:\n{history_text}\n\n"
-            f"AVAILABLE ACTIONS:\n"
+            + (self._diplomacy_section(faction_name) if self.diplomacy_log else "")
+            + f"RECENT EVENTS:\n{history_text}\n\n"
+            + reasoning_section
+            + f"AVAILABLE ACTIONS:\n"
             f"  TAX             — gain {f.tax_yield()} gold (territory × 2)\n"
             f"{'  RECRUIT         — spend 3 gold, gain 2 army (army cap: ' + str(f.territory * 3) + ')' if f.gold >= 3 and f.army < f.territory * 3 else '  RECRUIT         — UNAVAILABLE (need 3 gold, have ' + str(f.gold) + ('; army at cap' if f.army >= f.territory * 3 else '') + ')'}\n"
-            f"  TRADE <faction> — mutual only: both gain min(territories) × 4 gold; refused = you gain nothing\n\n"
+            f"  TRADE <faction> — mutual only: both gain min(territories) × 4 gold; refused = you gain nothing (cannot trade with yourself)\n\n"
             f"RAID WIN PROBABILITIES (costs {RAID_COST} gold; winner takes 1 territory + target's gold÷territories):\n"
             f"{raid_odds if f.army > 0 else '  RAID — UNAVAILABLE (you have 0 army)'}\n\n"
             f"RULES:\n"

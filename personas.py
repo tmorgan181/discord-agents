@@ -8,6 +8,7 @@ PERSONAS = {
         "model": "Aurion",
         "token_env_var": "DISCORD_TOKEN_AURION",
         "avatar_emoji": "✨",
+        "realm_player": True,
     },
 
     "librarian": {
@@ -45,13 +46,13 @@ PERSONAS = {
         "avatar_emoji": "🔬",
         "thinking_model": True,
     },
-    
+
     "genghis": {
         "name": "Genghis",
         "model": "Genghis",
         "token_env_var": "DISCORD_TOKEN_GENGHIS",
         "avatar_emoji": "🏹",
-        "thinking_model": True,
+        "realm_player": True,
     },
 
     "joan": {
@@ -59,6 +60,15 @@ PERSONAS = {
         "model": "Joan",
         "token_env_var": "DISCORD_TOKEN_JOAN",
         "avatar_emoji": "⚜️",
+        "realm_player": True,
+    },
+
+    "itrion": {
+        "name": "Itrion",
+        "model": "Itrion",
+        "token_env_var": "DISCORD_TOKEN_ITRION",
+        "avatar_emoji": "🌑",
+        "realm_player": True,
     },
 
     "facilitator": {

@@ -55,6 +55,16 @@ class OllamaClient:
                     break
         return "".join(full)
 
+    @staticmethod
+    def _fmt_messages(messages: List[Dict[str, str]]) -> str:
+        """Format a messages list for debug logging."""
+        parts = []
+        for m in messages:
+            role = m.get("role", "?").upper()
+            content = m.get("content", "")
+            parts.append(f"  [{role}]\n{content}")
+        return "\n".join(parts)
+
     async def generate_response(
         self,
         model: str,
@@ -75,6 +85,13 @@ class OllamaClient:
             }
         }
         logger.info(f"[Ollama] generate → {model} | prompt: {prompt[:80].strip()!r}")
+        logger.debug(
+            f"[Ollama] generate → {model} FULL PROMPT\n"
+            f"{'='*60}\n"
+            f"{('  [SYSTEM]\n' + system_prompt) if system_prompt else ''}\n"
+            f"  [PROMPT]\n{prompt}\n"
+            f"{'='*60}"
+        )
         t0 = time.monotonic()
         try:
             loop = asyncio.get_running_loop()
@@ -88,6 +105,10 @@ class OllamaClient:
             text = _strip_think(text)
             elapsed = time.monotonic() - t0
             logger.info(f"[Ollama] generate ← {model} | {elapsed:.1f}s | {len(text)} chars")
+            logger.debug(
+                f"[Ollama] generate ← {model} FULL RESPONSE\n"
+                f"{'='*60}\n{text}\n{'='*60}"
+            )
             return text
         except Exception as e:
             elapsed = time.monotonic() - t0
@@ -119,6 +140,12 @@ class OllamaClient:
             ""
         )
         logger.info(f"[Ollama] chat → {model} | {len(messages)} msgs | last: {last_user.strip()!r}")
+        logger.debug(
+            f"[Ollama] chat → {model} FULL MESSAGES\n"
+            f"{'='*60}\n"
+            f"{self._fmt_messages(messages)}\n"
+            f"{'='*60}"
+        )
         t0 = time.monotonic()
         try:
             loop = asyncio.get_running_loop()
@@ -132,6 +159,10 @@ class OllamaClient:
             text = _strip_think(text)
             elapsed = time.monotonic() - t0
             logger.info(f"[Ollama] chat ← {model} | {elapsed:.1f}s | {len(text)} chars")
+            logger.debug(
+                f"[Ollama] chat ← {model} FULL RESPONSE\n"
+                f"{'='*60}\n{text}\n{'='*60}"
+            )
             return text
         except Exception as e:
             elapsed = time.monotonic() - t0
